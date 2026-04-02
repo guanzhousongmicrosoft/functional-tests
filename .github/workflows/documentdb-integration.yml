@@ -1,0 +1,186 @@
+name: DocumentDB Integration Tests
+
+on:
+  repository_dispatch:
+    types: [run-documentdb-tests]
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  PG_VERSION: "17"
+
+jobs:
+  integration-test:
+    name: Functional Tests (DocumentDB PG${{ github.event.client_payload.pg_version || '17' }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      # -- Report pending status back to source PR --
+      - name: Set pending status on source PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DOCUMENTDB_REPO_TOKEN }}
+          script: |
+            const [owner, repo] = '${{ github.event.client_payload.source_repo }}'.split('/');
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: '${{ github.event.client_payload.source_sha }}',
+              state: 'pending',
+              context: 'Functional Tests / DocumentDB Integration',
+              description: 'Running functional tests...',
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
+
+      # -- Checkout both repos --
+      - name: Checkout functional-tests
+        uses: actions/checkout@v4
+        with:
+          path: functional-tests
+
+      - name: Checkout DocumentDB
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.client_payload.source_repo }}
+          ref: ${{ github.event.client_payload.source_sha }}
+          path: documentdb
+          token: ${{ secrets.DOCUMENTDB_REPO_TOKEN }}
+
+      # -- Build DocumentDB --
+      - name: Build and Install DocumentDB
+        working-directory: documentdb
+        run: |
+          chmod +x ./scripts/build_documentdb_with_scripts.sh
+          ./scripts/build_documentdb_with_scripts.sh --pg-version ${{ env.PG_VERSION }} --citus-version 12
+
+      - name: Export pg_config PATH
+        run: echo "/usr/lib/postgresql/${{ env.PG_VERSION }}/bin" >> $GITHUB_PATH
+
+      # -- Build Gateway --
+      - name: Install Rust
+        working-directory: documentdb
+        run: |
+          export CARGO_HOME=$HOME/.cargo
+          export RUSTUP_HOME=$HOME/.rustup
+          ./scripts/install_rustup.sh --install-toolchain
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install Rust tools
+        working-directory: documentdb
+        run: ./scripts/install_rust_tools.sh ./rust-toolchain.toml
+
+      - name: Build and Install Gateway host
+        working-directory: documentdb
+        run: ./scripts/build_and_install_with_pgrx.sh -v ${{ env.PG_VERSION }} -d ./pg_documentdb_gw_host
+
+      # -- Start DocumentDB with Gateway --
+      - name: Start DocumentDB with Gateway
+        working-directory: documentdb
+        run: |
+          export PG_VERSION_USED=${{ env.PG_VERSION }}
+          mkdir -p $RUNNER_TEMP/pgdata
+          ./scripts/start_oss_server.sh -d $RUNNER_TEMP/pgdata -c -r -g
+
+      - name: Wait for Gateway readiness
+        run: |
+          pip install pymongo
+          python3 -c "
+          import time, sys
+          from pymongo import MongoClient
+          for i in range(30):
+              try:
+                  client = MongoClient(
+                      'mongodb://docdb_admin:Admin100@localhost:10260/?tls=true&tlsAllowInvalidCertificates=true',
+                      serverSelectionTimeoutMS=2000)
+                  client.admin.command('ping')
+                  print('Gateway is ready')
+                  sys.exit(0)
+              except Exception as e:
+                  print(f'Waiting for gateway... ({i+1}/30): {e}')
+                  time.sleep(2)
+          print('Gateway failed to start')
+          sys.exit(1)
+          "
+
+      # -- Run Functional Tests --
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install -r functional-tests/requirements.txt
+
+      - name: Run Functional Tests
+        working-directory: functional-tests
+        run: |
+          pytest documentdb_tests/ \
+            --connection-string "mongodb://docdb_admin:Admin100@localhost:10260/?tls=true&tlsAllowInvalidCertificates=true" \
+            --engine-name documentdb \
+            -n auto \
+            -v \
+            --json-report --json-report-file=${{ github.workspace }}/.test-results/documentdb-report.json \
+            --junitxml=${{ github.workspace }}/.test-results/documentdb-results.xml
+
+      # -- Upload results --
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: functional-test-results
+          path: .test-results/
+
+      - name: Generate test summary
+        if: always()
+        working-directory: functional-tests
+        run: |
+          python -m documentdb_tests.compatibility.result_analyzer \
+            ${{ github.workspace }}/.test-results/documentdb-report.json \
+            --format github >> $GITHUB_STEP_SUMMARY || true
+
+      - name: Upload server logs
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: server-logs
+          path: |
+            ${{ runner.temp }}/pgdata/pglog.log
+            ${{ runner.temp }}/pgdata/*.log
+
+      # -- Report final status --
+      - name: Report success status
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DOCUMENTDB_REPO_TOKEN }}
+          script: |
+            const [owner, repo] = '${{ github.event.client_payload.source_repo }}'.split('/');
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: '${{ github.event.client_payload.source_sha }}',
+              state: 'success',
+              context: 'Functional Tests / DocumentDB Integration',
+              description: 'Functional tests passed',
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
+
+      - name: Report failure status
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DOCUMENTDB_REPO_TOKEN }}
+          script: |
+            const [owner, repo] = '${{ github.event.client_payload.source_repo }}'.split('/');
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: '${{ github.event.client_payload.source_sha }}',
+              state: 'failure',
+              context: 'Functional Tests / DocumentDB Integration',
+              description: 'Functional tests failed',
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
